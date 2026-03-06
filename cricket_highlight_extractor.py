@@ -21,24 +21,49 @@ class CricketHighlightExtractor:
         This is highly effective for indoor/net sessions.
         """
         print(f"Analyzing audio for shots in {video_path}...")
+        temp_audio_path = "temp_audio.wav"
         
-        # Load audio using librosa directly from the video file
-        y, sr = librosa.load(video_path, sr=None)
-        
-        # Calculate the onset strength (sudden changes/impacts in audio)
-        onset_env = librosa.onset.onset_strength(y=y, sr=sr, aggregate=np.median)
-        
-        # Find peaks in the onset envelope
-        # distance: minimum seconds between shots (e.g., a bowler takes at least 5 seconds to bowl again)
-        # prominence: threshold for how loud/distinct the sound must be
-        min_distance_frames = int(5.0 * (sr / 512)) # ~5 seconds apart
-        peaks, _ = find_peaks(onset_env, distance=min_distance_frames, prominence=1.5)
-        
-        # Convert frame indices to timestamps in seconds
-        timestamps = librosa.frames_to_time(peaks, sr=sr)
-        
-        print(f"Detected {len(timestamps)} shots via Audio at seconds: {[round(t, 2) for t in timestamps]}")
-        return timestamps
+        try:
+            # Use MoviePy to safely extract audio to a standard WAV file first
+            # This avoids librosa's NoBackendError when dealing with MP4s directly
+            print("Extracting audio track for analysis...")
+            video = VideoFileClip(video_path)
+            
+            if video.audio is None:
+                print("Error: No audio track found in the video.")
+                return []
+                
+            video.audio.write_audiofile(temp_audio_path, logger=None)
+            video.close()
+            
+            # Load the extracted audio using librosa
+            y, sr = librosa.load(temp_audio_path, sr=None)
+            
+            # Calculate the onset strength (sudden changes/impacts in audio)
+            onset_env = librosa.onset.onset_strength(y=y, sr=sr, aggregate=np.median)
+            
+            # Find peaks in the onset envelope
+            # distance: minimum seconds between shots (e.g., a bowler takes at least 5 seconds to bowl again)
+            # prominence: threshold for how loud/distinct the sound must be
+            min_distance_frames = int(5.0 * (sr / 512)) # ~5 seconds apart
+            peaks, _ = find_peaks(onset_env, distance=min_distance_frames, prominence=1.5)
+            
+            # Convert frame indices to timestamps in seconds
+            timestamps = librosa.frames_to_time(peaks, sr=sr)
+            
+            print(f"Detected {len(timestamps)} shots via Audio at seconds: {[round(t, 2) for t in timestamps]}")
+            return timestamps
+            
+        except Exception as e:
+            print(f"An error occurred during audio detection: {e}")
+            return []
+        finally:
+            # Clean up: delete the temporary audio file
+            if os.path.exists(temp_audio_path):
+                try:
+                    os.remove(temp_audio_path)
+                except OSError:
+                    pass
 
     def detect_shots_vision(self, video_path):
         """
@@ -102,6 +127,13 @@ class CricketHighlightExtractor:
         try:
             video = VideoFileClip(input_video)
             duration = video.duration
+            
+            # Calculate the source video's exact bitrate to match its quality
+            file_size_bytes = os.path.getsize(input_video)
+            estimated_bitrate_bps = (file_size_bytes * 8) / duration
+            source_bitrate = f"{int(estimated_bitrate_bps / 1000)}k"
+            print(f"Source video bitrate estimated at {source_bitrate}. Matching output quality...")
+
             clips = []
             
             for t in timestamps:
@@ -140,14 +172,14 @@ class CricketHighlightExtractor:
             # Use all available cores for rendering
             num_threads = os.cpu_count() or 4
             
-            # Write the result to a file with higher quality settings
+            # Write the result to a file matching the original bitrate
             final_clip.write_videofile(
                 output_video, 
                 codec=codec, 
                 audio_codec="aac", 
                 threads=num_threads,
-                preset="medium",                     # Better baseline compression
-                bitrate="15000k",                    # 15 Mbps high bitrate for quality
+                preset="medium",                     # Medium provides a good balance of speed and size
+                bitrate=source_bitrate,              # Matched exactly to the original video
                 ffmpeg_params=["-pix_fmt", "yuv420p"] # Guarantee color compatibility
             )
             print(f"Highlights successfully saved to {output_video}")
@@ -161,8 +193,8 @@ class CricketHighlightExtractor:
 
 if __name__ == "__main__":
     # --- Configuration ---
-    INPUT_FILE = "sample_input.mp4"
-    OUTPUT_FILE = "automated_highlights.mp4"
+    INPUT_FILE = "Timeline 1.mov"  # Path to your input cricket video
+    OUTPUT_FILE = "Timeline_1_automated_highlights.mp4"
     
     # Enable NVIDIA acceleration if you have an NVIDIA GPU, otherwise set to None
     # Change to "qsv" if you have an Intel integrated GPU
