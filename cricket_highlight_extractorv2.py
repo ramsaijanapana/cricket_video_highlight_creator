@@ -3,6 +3,7 @@ import cv2
 import numpy as np
 import librosa
 import subprocess
+import argparse
 from scipy.signal import find_peaks, butter, filtfilt
 
 # Attempt to locate FFmpeg (installed automatically with moviepy/imageio)
@@ -13,7 +14,7 @@ except ImportError:
     FFMPEG_PATH = "ffmpeg"  # Fallback to system PATH
 
 class CricketHighlightExtractor:
-    def __init__(self, pre_shot_time=1.0, post_shot_time=0.5):
+    def __init__(self, pre_shot_time=1.5, post_shot_time=2.0):
         """
         Initializes the extractor.
         :param pre_shot_time: Seconds to include before the shot is played.
@@ -33,16 +34,16 @@ class CricketHighlightExtractor:
         y = filtfilt(b, a, data)
         return y
 
-    def detect_shots_audio(self, video_path):
+    def detect_shots_audio(self, video_path, cutoff_freq=3000.0, prominence_thresh=3.5):
         """
         Detects cricket shots by finding loud impact spikes in the audio track.
-        Now uses a high-pass filter for extreme accuracy.
+        Uses a high-pass filter and peak detection for accuracy.
         """
         print(f"Analyzing audio for shots in {video_path}...")
         temp_audio_path = "temp_audio_extract.wav"
         
         try:
-            # 1. Use raw FFmpeg to extract audio instantly (fixes NoBackendError)
+            # 1. Use raw FFmpeg to extract audio instantly
             print("Extracting audio track for analysis...")
             cmd_extract = [
                 FFMPEG_PATH, "-y", "-i", video_path, 
@@ -57,16 +58,19 @@ class CricketHighlightExtractor:
             # 2. Load audio
             y, sr = librosa.load(temp_audio_path, sr=None)
             
-            # 3. Apply High-Pass Filter (Isolate frequencies above 2000 Hz)
-            # This isolates the bat crack and removes heavy background noises
-            y_filtered = self._highpass_filter(y, cutoff=2000.0, fs=sr)
+            # 3. Apply High-Pass Filter 
+            # Increased to 3000Hz to aggressively ignore net-hits and bowling machine noises
+            y_filtered = self._highpass_filter(y, cutoff=cutoff_freq, fs=sr)
             
             # 4. Calculate onset strength on the filtered audio
-            onset_env = librosa.onset.onset_strength(y=y_filtered, sr=sr, aggregate=np.median)
+            # Changed aggregate to np.max to find sharper impulse attacks (the crack)
+            onset_env = librosa.onset.onset_strength(y=y_filtered, sr=sr, aggregate=np.max)
             
             # 5. Find peaks 
-            min_distance_frames = int(5.0 * (sr / 512)) # ~5 seconds apart
-            peaks, _ = find_peaks(onset_env, distance=min_distance_frames, prominence=1.5)
+            min_distance_frames = int(5.0 * (sr / 512)) # ~5 seconds apart to prevent overlapping clips
+            
+            # Prominence increased to filter out footsteps, background clicks, and ball-leaving sounds
+            peaks, _ = find_peaks(onset_env, distance=min_distance_frames, prominence=prominence_thresh)
             
             timestamps = librosa.frames_to_time(peaks, sr=sr)
             print(f"Detected {len(timestamps)} shots via Filtered Audio at seconds: {[round(t, 2) for t in timestamps]}")
@@ -121,15 +125,19 @@ class CricketHighlightExtractor:
         print(f"Detected {len(timestamps)} shots via Vision at seconds: {[round(t, 2) for t in timestamps]}")
         return timestamps
 
-    def create_highlights(self, input_video, output_video, timestamps, hw_accel=None):
+    def create_highlights(self, input_video, output_video, timestamps, hw_accel=None, pre_shot_time=None, post_shot_time=None):
         """
         Uses raw FFmpeg subprocesses to extract and concatenate clips.
         This provides maximum speed and zero quality loss.
         """
         print("Generating highlight reel...")
-        if not timestamps:
+        if len(timestamps) == 0:
             print("No shots found to create highlights.")
             return
+
+        # Override class defaults if specific times are provided
+        pre_time = pre_shot_time if pre_shot_time is not None else self.pre_shot_time
+        post_time = post_shot_time if post_shot_time is not None else self.post_shot_time
 
         # Get video duration using ffprobe/cv2
         cap = cv2.VideoCapture(input_video)
@@ -144,31 +152,38 @@ class CricketHighlightExtractor:
         try:
             # Step 1: Slice out the individual highlights rapidly
             for i, t in enumerate(timestamps):
-                start_t = max(0, t - self.pre_shot_time)
-                clip_duration = min(duration - start_t, self.pre_shot_time + self.post_shot_time)
+                start_t = max(0, t - pre_time)
+                clip_duration = min(duration - start_t, pre_time + post_time)
                 clip_name = f"temp_highlight_{i}.mp4"
                 temp_clips.append(clip_name)
 
                 print(f"Slicing clip {i+1}/{len(timestamps)} ({round(start_t, 2)}s to {round(start_t + clip_duration, 2)}s)...")
 
-                # Set up encoding parameters
+                # Quality configuration to match source visually (CRF/CQ 17 is essentially transparent)
                 vcodec = "libx264"
+                preset = "slow" # Slower preset preserves more quality
+                quality_args = ["-crf", "17"] 
+
                 if hw_accel == "nvenc":
                     vcodec = "h264_nvenc"
+                    preset = "p6" # High quality preset for NVENC
+                    quality_args = ["-cq", "17", "-b:v", "0"] # NVENC constant quality flag
                 elif hw_accel == "qsv":
                     vcodec = "h264_qsv"
+                    preset = "slow"
+                    quality_args = ["-global_quality", "17"] # QSV constant quality flag
 
+                # Frame-accurate slicing (re-encoding with high quality settings to prevent keyframe stuttering)
                 cmd_slice = [
                     FFMPEG_PATH, "-y",
                     "-ss", str(start_t),
                     "-i", input_video,
                     "-t", str(clip_duration),
                     "-c:v", vcodec,
-                    "-preset", "fast",
-                    "-crf", "18", # CRF 18 is visually lossless (matches original quality)
+                    "-preset", preset
+                ] + quality_args + [
                     "-c:a", "aac",
-                    "-b:a", "192k",
-                    # This filter forces even dimensions, preventing vertical video banding
+                    "-b:a", "256k", # High quality audio
                     "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
                     "-pix_fmt", "yuv420p",
                     clip_name
@@ -206,20 +221,36 @@ class CricketHighlightExtractor:
                 os.remove(list_file)
 
 if __name__ == "__main__":
-    # --- Configuration ---
-    INPUT_FILE = "sample_input.mp4"
-    OUTPUT_FILE = "automated_highlights.mp4"
+    # --- Configuration via Command Line Arguments ---
+    parser = argparse.ArgumentParser(description="Extract cricket highlights from a video.")
+    parser.add_argument("-i", "--input", default="sample_input.mp4", help="Input video file")
+    parser.add_argument("-o", "--output", default="automated_sample_input.mp4", help="Output video file")
+    parser.add_argument("--hw", default="nvenc", choices=["nvenc", "qsv", "none"], help="Hardware acceleration to use")
+    parser.add_argument("--pre", type=float, default=1.5, help="Seconds before the shot (optional)")
+    parser.add_argument("--post", type=float, default=2.0, help="Seconds after the shot (optional)")
+    parser.add_argument("--cutoff", type=float, default=3000.0, help="Audio highpass cutoff frequency")
+    parser.add_argument("--prominence", type=float, default=3.0, help="Peak prominence threshold")
     
-    # Options: "nvenc" (NVIDIA), "qsv" (Intel), or None (CPU - still very fast!)
-    HW_ACCELERATION = "nvenc" 
+    args = parser.parse_args()
+
+    INPUT_FILE = args.input
+    OUTPUT_FILE = args.output
+    HW_ACCELERATION = args.hw if args.hw.lower() != "none" else None
     
-    extractor = CricketHighlightExtractor(pre_shot_time=1.0, post_shot_time=0.5)
+    extractor = CricketHighlightExtractor(pre_shot_time=args.pre, post_shot_time=args.post)
     
     # Step 1: Detect Timestamps
-    shot_timestamps = extractor.detect_shots_audio(INPUT_FILE)
+    shot_timestamps = extractor.detect_shots_audio(INPUT_FILE, cutoff_freq=args.cutoff, prominence_thresh=args.prominence)
     
     # Step 2: Trim and Merge Video using ultra-fast FFmpeg subprocesses
     if len(shot_timestamps) > 0:
-        extractor.create_highlights(INPUT_FILE, OUTPUT_FILE, shot_timestamps, hw_accel=HW_ACCELERATION)
+        extractor.create_highlights(
+            INPUT_FILE, 
+            OUTPUT_FILE, 
+            shot_timestamps, 
+            hw_accel=HW_ACCELERATION,
+            pre_shot_time=args.pre,
+            post_shot_time=args.post
+        )
     else:
         print("Pipeline finished: No shots were detected.")
